@@ -1,0 +1,157 @@
+.kb-chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  font-size: 13px;
+}
+
+.kb-chat-context {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kb-context-label {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.kb-context-empty {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.kb-chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.kb-message {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 100%;
+}
+
+.kb-message-role {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+
+.kb-message-user .kb-message-role {
+  color: var(--color-accent);
+}
+
+.kb-message-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+  color: var(--text-normal);
+}
+
+.kb-chat-input-area {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+/* ── Diff decorations ───────────────────────────────────────── */
+
+.kb-diff-removed {
+  background-color: rgba(255, 80, 80, 0.18) !important;
+  text-decoration: line-through;
+  text-decoration-color: rgba(200, 50, 50, 0.6);
+}
+
+.kb-diff-added {
+  background-color: rgba(60, 200, 80, 0.18);
+  display: block;
+  padding: 0 4px;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: var(--line-height-normal, 1.5);
+  color: var(--text-normal);
+  min-height: 1em;
+}
+
+/* ── Proposal actions ───────────────────────────────────────── */
+
+.kb-proposal-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  align-items: center;
+}
+
+.kb-apply-btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  background: var(--color-green);
+  color: white;
+  font-size: 12px;
+  cursor: pointer;
+  border: none;
+}
+
+.kb-dismiss-btn {
+  padding: 4px 12px;
+  border-radius: 4px;
+  background: var(--background-modifier-error);
+  color: white;
+  font-size: 12px;
+  cursor: pointer;
+  border: none;
+}
+
+.kb-applied-label {
+  font-size: 12px;
+  color: var(--color-green);
+}
+
+/* ── Input ──────────────────────────────────────────────────── */
+
+.kb-chat-input-area textarea {
+  width: 100%;
+  min-height: 72px;
+  max-height: 180px;
+  resize: vertical;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.4;
+  box-sizing: border-box;
+}
+
+.kb-send-btn {
+  align-self: flex-end;
+  padding: 5px 14px;
+  border-radius: 5px;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-size: 13px;
+  cursor: pointer;
+  border: none;
+}
+
+.kb-send-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
