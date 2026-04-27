@@ -38,6 +38,9 @@ const context = await esbuild.context({
       build.onEnd(() => {
         copyFileSync("manifest.json", `${VAULT_PLUGIN}/manifest.json`);
         copyFileSync("styles.css", `${VAULT_PLUGIN}/styles.css`);
+        copyFileSync(`${VAULT_PLUGIN}/main.js`, "main.js");
+        copyFileSync("manifest.json", "manifest.json");
+        copyFileSync("styles.css", "styles.css");
         console.log(`→ synced to ${VAULT_PLUGIN}`);
       });
     },
