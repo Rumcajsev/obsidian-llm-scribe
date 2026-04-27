@@ -109,8 +109,10 @@ function anthropicStream(
 	apiKey: string,
 	body: string,
 	onEvent: (ev: StreamChunk) => void,
+	signal?: AbortSignal,
 ): Promise<void> {
 	return new Promise((resolve, reject) => {
+		if (signal?.aborted) { resolve(); return; }
 		const req = https.request({
 			hostname: 'api.anthropic.com',
 			port: 443,
@@ -149,9 +151,10 @@ function anthropicStream(
 				}
 			});
 			res.on('end', resolve);
-			res.on('error', reject);
+			res.on('error', (err) => { if (signal?.aborted) resolve(); else reject(err); });
 		});
-		req.on('error', reject);
+		signal?.addEventListener('abort', () => { req.destroy(); resolve(); });
+		req.on('error', (err) => { if (signal?.aborted) resolve(); else reject(err); });
 		req.write(body);
 		req.end();
 	});
@@ -187,8 +190,10 @@ function openaiStream(
 	apiKey: string,
 	body: string,
 	onEvent: (ev: OAIStreamChunk) => void,
+	signal?: AbortSignal,
 ): Promise<void> {
 	return new Promise((resolve, reject) => {
+		if (signal?.aborted) { resolve(); return; }
 		const url = new URL('/chat/completions', baseUrl.replace(/\/$/, ''));
 		const isHttps = url.protocol === 'https:';
 		const transport = isHttps ? https : http;
@@ -231,9 +236,10 @@ function openaiStream(
 				}
 			});
 			res.on('end', resolve);
-			res.on('error', reject);
+			res.on('error', (err) => { if (signal?.aborted) resolve(); else reject(err); });
 		});
-		req.on('error', reject);
+		signal?.addEventListener('abort', () => { req.destroy(); resolve(); });
+		req.on('error', (err) => { if (signal?.aborted) resolve(); else reject(err); });
 		req.write(body);
 		req.end();
 	});
@@ -375,7 +381,7 @@ const ANTHROPIC_SEARCH_TOOL = {
 
 const ANTHROPIC_CREATE_TOOL = {
 	name: 'create_notes',
-	description: 'Propose creating one or more new notes in the vault. Call this tool directly — do not describe the creation in text. Always use search_notes first to check no suitable note already exists. Each item is shown as a separate proposal for the user to confirm individually.',
+	description: 'Propose creating one or more new notes in the vault. Each item is shown as a separate proposal for the user to confirm individually.',
 	input_schema: {
 		type: 'object',
 		properties: {
@@ -398,7 +404,7 @@ const ANTHROPIC_CREATE_TOOL = {
 
 const ANTHROPIC_MODIFY_TOOL = {
 	name: 'modify_notes',
-	description: 'Propose appending content to or editing one or more existing notes. Call this tool directly — do not describe the action in text. Use search_notes first to identify the right notes. Each item is shown as a separate proposal for the user to confirm individually. Use "append" to add new content without touching existing content. Use "edit" only when existing content needs to change — the user will see a diff and the full note will be replaced, so use it carefully.',
+	description: 'Propose appending content to or editing one or more existing notes. Each item is shown as a separate proposal for the user to confirm individually. Use "append" to add new content without touching existing content. Use "edit" only when existing content needs to change — the user will see a diff and the full note will be replaced, so use it carefully.',
 	input_schema: {
 		type: 'object',
 		properties: {
@@ -421,6 +427,19 @@ const ANTHROPIC_MODIFY_TOOL = {
 };
 
 // ── Append helper ─────────────────────────────────────────────────────────────
+
+const HISTORY_CHAR_LIMIT = 40_000;
+
+function trimHistory(messages: Message[]): Message[] {
+	let total = messages.reduce((sum, m) => sum + m.content.length, 0);
+	let start = 0;
+	// Drop oldest user+assistant pairs until under the limit
+	while (total > HISTORY_CHAR_LIMIT && start + 1 < messages.length) {
+		total -= messages[start].content.length + messages[start + 1].content.length;
+		start += 2;
+	}
+	return messages.slice(start);
+}
 
 function appendToSection(noteContent: string, heading: string | undefined, newContent: string): string {
 	const trimmed = noteContent.trimEnd();
@@ -458,6 +477,8 @@ class ChatView extends ItemView {
 	private contextPillsEl!: HTMLElement;
 	private modelIndicatorEl!: HTMLElement;
 	private isBusy = false;
+	private abortController: AbortController | null = null;
+	private stopBtnEl!: HTMLButtonElement;
 	private activeFilePath: string | null = null;
 	private currentSessionPath: string | null = null;
 	private currentNotePath: string | null = null;
@@ -517,9 +538,16 @@ class ChatView extends ItemView {
 			if (sendKey) { e.preventDefault(); this.sendMessage(); }
 		});
 
-		this.modelIndicatorEl = inputArea.createDiv('kb-model-indicator');
+		const inputFooter = inputArea.createDiv('kb-input-footer');
+		this.modelIndicatorEl = inputFooter.createDiv('kb-model-indicator');
 		this.updateModelIndicator();
 		this.modelIndicatorEl.addEventListener('click', (e) => this.openModelMenu(e));
+
+		this.stopBtnEl = inputFooter.createEl('button', { cls: 'kb-stop-btn' });
+		setIcon(this.stopBtnEl.createSpan('kb-stop-icon'), 'square');
+		this.stopBtnEl.createSpan({ text: 'Stop' });
+		this.stopBtnEl.style.display = 'none';
+		this.stopBtnEl.addEventListener('click', () => this.abortController?.abort());
 	}
 
 	// ── Session management ────────────────────────────────────────────────────
@@ -853,22 +881,12 @@ class ChatView extends ItemView {
 
 		const contextBlocks = await Promise.all(this.contextFiles.map(async f => {
 			const content = await this.app.vault.read(f);
-			return `## ${f.basename}\n\n${content}`;
+			return `## ${f.basename} (path: ${f.path})\n\n${content}`;
 		}));
 
 		const multi = this.contextFiles.length > 1;
-		let editHint = '';
-		if (this.contextFiles.length >= 1) {
-			const mode = this.plugin.settings.editMode;
-			if (mode === 'on_request') {
-				editHint = ' Only use the modify_notes tool to edit notes when the user explicitly asks you to edit or update them.';
-			} else if (mode === 'proactive') {
-				editHint = ' You may proactively propose edits using the modify_notes tool when the conversation produces something clearly worth capturing: a decision reached, a significant refinement of an idea, a new section that naturally extends a note, or an action item that emerged. Do not suggest edits for minor clarifications or conversational exchanges.';
-			}
-		}
-
 		let prompt = contextBlocks.length
-			? `${base} The user has the following note${multi ? 's' : ''} as context:\n\n${contextBlocks.join('\n\n---\n\n')}\n\nHelp them think through ideas.${editHint}`
+			? `${base} The user has the following note${multi ? 's' : ''} as context:\n\n${contextBlocks.join('\n\n---\n\n')}\n\nHelp them think through ideas.`
 			: base;
 
 		if (semanticHits.length > 0) {
@@ -886,60 +904,87 @@ class ChatView extends ItemView {
 				const sections = hits
 					.map(h => h.heading ? `### ${h.heading}\n\n${h.text}` : h.text)
 					.join('\n\n');
-				return `## ${file.basename}\n\n${sections}`;
+				return `## ${file.basename} (path: ${path})\n\n${sections}`;
 			}))).filter(Boolean) as string[];
 
 			if (relatedBlocks.length > 0)
-				prompt += `\n\n---\n\nPotentially related notes (retrieved by semantic search — reference if relevant, suggest [[wikilinks]] where appropriate):\n\n${relatedBlocks.join('\n\n---\n\n')}`;
+				prompt += `\n\n---\n\nRelevant notes from the vault (pre-fetched — use these directly to answer questions or identify notes to modify; only call search_notes if you need something not already shown here):\n\n${relatedBlocks.join('\n\n---\n\n')}`;
 		}
 
 		const canSearch = this.plugin.canSearch();
-		if (canSearch)
-			prompt += ' Use the search_notes tool when the user\'s question might be answered by their notes, or before creating or appending to a note.';
-
 		const createMode = this.plugin.settings.createMode;
 		const editMode = this.plugin.settings.editMode;
 		const appendMode = this.plugin.settings.appendMode;
 		const canCreate = createMode !== 'never';
-		const canModify = editMode !== 'never' || appendMode !== 'never';
+		const canAppend = appendMode !== 'never';
+		const canEdit = editMode !== 'never';
 
-		if (canCreate || canModify) {
+		if (canCreate || canAppend || canEdit) {
 			const currentFolder = this.contextFiles[0]?.parent?.path;
 			const folderHint = currentFolder ? ` Default new notes to the "${currentFolder}" folder unless context suggests a better location.` : '';
-			const isProactive = createMode === 'proactive' || editMode === 'proactive' || appendMode === 'proactive';
-			const trigger = isProactive
-				? 'When the conversation produces something worth saving'
-				: 'When the user asks to save something';
 
-			let hint = ` ${trigger}, always use search_notes first, then immediately call the appropriate tool — no text between the search result and the tool call.`;
-			if (canModify && canCreate)
-				hint += ` Use modify_notes to append or edit existing notes (prefer append unless content must change), or create_notes if no suitable note exists.`;
-			else if (canModify)
-				hint += ` Use modify_notes to append or edit existing notes — prefer append unless existing content must change.`;
-			else
-				hint += ` Use create_notes if no suitable note exists.`;
-			hint += ` Never write text that describes or announces what you are about to do with a tool — do not say "I'll create", "Creating now", "No existing note, so I will…" or anything similar. Call the tool directly, then write any explanatory text after.${folderHint}`;
-			prompt += hint;
+			const rules: string[] = [];
+
+			if (canAppend) {
+				rules.push(appendMode === 'proactive'
+					? 'Use modify_notes (operation "append") when the conversation produces content clearly worth adding to an existing note — a decision, a key insight, or an action item. Prefer append over edit whenever possible.'
+					: 'Use modify_notes (operation "append") only when the user explicitly asks to add content to a note. Prefer append over edit whenever possible.');
+			}
+
+			if (canEdit) {
+				rules.push(editMode === 'proactive'
+					? 'Use modify_notes (operation "edit") when existing note content needs meaningful revision based on what was discussed. Use sparingly — it replaces the entire note.'
+					: 'Use modify_notes (operation "edit") only when the user explicitly asks to edit or rewrite a note. It replaces the entire note, so use it carefully.');
+			}
+
+			if (canCreate) {
+				rules.push(createMode === 'proactive'
+					? 'Use create_notes when the conversation produces something worth capturing as a new standalone note and no suitable note exists yet.'
+					: 'Use create_notes only when the user explicitly asks to create a new note and no suitable note exists yet.');
+			}
+
+			if (canSearch) {
+				rules.push('If the pre-fetched notes above don\'t fully answer the user\'s question, use search_notes to broaden the search.');
+				if (canAppend || canEdit)
+					rules.push('Before calling modify_notes, use the path shown in the note heading above if the note is already in context. Otherwise call search_notes first to get the exact vault path — it must not be guessed.');
+				if (canCreate)
+					rules.push('Before calling create_notes, call search_notes to confirm no suitable note already exists.');
+				rules.push('Call the appropriate tool immediately after search_notes — no text in between.');
+			}
+			rules.push(`Never write text announcing what you are about to do with a tool — do not say "I'll create", "Creating now", or anything similar. Call the tool directly, then write any explanatory text after.${folderHint}`);
+
+			prompt += '\n\nNote-writing rules:\n' + rules.map(r => `- ${r}`).join('\n');
+		} else if (canSearch) {
+			if (semanticHits.length > 0) {
+				prompt += ' Relevant notes are already provided above — answer from them directly. Use search_notes only if you need something not covered there.';
+			} else {
+				prompt += ' Use the search_notes tool when the user\'s question might be answered by their notes.';
+			}
 		}
 
 		return prompt;
 	}
 
 	private renderSemanticPreview(hits: ChunkHit[], msgEl: HTMLElement) {
-		const seen = new Set<string>();
-		const files: TFile[] = [];
+		// Group hits by note path, preserving first-appearance order
+		const byPath = new Map<string, ChunkHit[]>();
 		for (const hit of hits) {
-			if (seen.has(hit.path)) continue;
-			seen.add(hit.path);
-			const file = this.app.vault.getAbstractFileByPath(hit.path);
-			if (file instanceof TFile) files.push(file);
+			const arr = byPath.get(hit.path);
+			if (arr) arr.push(hit);
+			else byPath.set(hit.path, [hit]);
 		}
-		if (!files.length) return;
+
+		const entries: Array<{ file: TFile; chunks: ChunkHit[] }> = [];
+		for (const [path, chunks] of byPath) {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile) entries.push({ file, chunks });
+		}
+		if (!entries.length) return;
 
 		let open = false;
 
 		const indicator = msgEl.createDiv('kb-semantic-indicator');
-		indicator.setText(`${files.length} related`);
+		indicator.setText(`${entries.length} related`);
 
 		const list = msgEl.createDiv('kb-semantic-list');
 		list.style.display = 'none';
@@ -950,13 +995,21 @@ class ChatView extends ItemView {
 			indicator.toggleClass('is-open', open);
 		});
 
-		for (const file of files) {
+		for (const { file, chunks } of entries) {
 			const row = list.createDiv('kb-semantic-item');
 
 			const nameEl = row.createSpan({ text: file.basename, cls: 'kb-semantic-name' });
 			nameEl.addEventListener('click', () =>
 				this.app.workspace.openLinkText(file.path, '', false)
 			);
+
+			// Build tooltip: one line per chunk — heading or first 60 chars of text
+			const tooltipLines = chunks.map(c => {
+				if (c.heading) return `› ${c.heading}`;
+				const preview = c.text.replace(/\s+/g, ' ').trim().slice(0, 60);
+				return `› ${preview}${c.text.length > 60 ? '…' : ''}`;
+			});
+			nameEl.setAttribute('title', tooltipLines.join('\n'));
 
 			const addBtn = row.createEl('button', { cls: 'kb-semantic-add', attr: { title: 'Add to context' } });
 			setIcon(addBtn, 'plus');
@@ -1035,14 +1088,19 @@ class ChatView extends ItemView {
 
 		this.isBusy = true;
 		this.inputEl.disabled = true;
+		this.abortController = new AbortController();
+		this.stopBtnEl.style.display = '';
 
 		try {
 			const caller = this.plugin.settings.provider === 'litellm'
 				? this.callLiteLLM.bind(this)
 				: this.callAnthropic.bind(this);
-			const { text: reply, proposedCreates, proposedModifications } = await caller(system, this.messages.slice(0, -1), text, editableFile, (chunk: string) => {
-				this.renderMarkdownTo(textEl, chunk);
-			});
+			const { text: reply, proposedCreates, proposedModifications } = await caller(
+				system, trimHistory(this.messages.slice(0, -1)), text, editableFile,
+				(chunk: string) => { this.renderMarkdownTo(textEl, chunk); },
+				(status: string) => { textEl.setText(status); },
+				this.abortController.signal,
+			);
 
 			const timestamp = Date.now();
 			stampEl.setText(this.formatStamp(timestamp));
@@ -1055,7 +1113,8 @@ class ChatView extends ItemView {
 				this.messages.push({ role: 'assistant', content: displayText, timestamp });
 				await this.saveSession();
 			} else {
-				textEl.empty();
+				if (reply) this.renderMarkdownTo(textEl, reply);
+				else textEl.empty();
 				this.messages.push({ role: 'assistant', content: reply, timestamp });
 				await this.saveSession();
 
@@ -1142,6 +1201,8 @@ class ChatView extends ItemView {
 			textEl.setText(`Error: ${msg}`);
 		} finally {
 			this.isBusy = false;
+			this.abortController = null;
+			this.stopBtnEl.style.display = 'none';
 			this.inputEl.disabled = false;
 			this.inputEl.focus();
 		}
@@ -1150,6 +1211,8 @@ class ChatView extends ItemView {
 	private async callAnthropic(
 		system: string, history: Message[], userMessage: string, file: TFile | null,
 		onChunk: (text: string) => void,
+		onStatus: (text: string) => void,
+		signal?: AbortSignal,
 	): Promise<{ text: string; proposedCreates: CreateProposal[] | null; proposedModifications: Modification[] | null }> {
 		const apiMessages: AnthropicMessage[] = [
 			...history.map(m => ({ role: m.role, content: m.content })),
@@ -1181,7 +1244,7 @@ class ChatView extends ItemView {
 				this.plugin.settings.anthropicApiKey,
 				JSON.stringify({
 					model: this.plugin.settings.anthropicModel,
-					max_tokens: turn === 0 ? 4096 : 1024,
+					max_tokens: 4096,
 					stream: true,
 					system, messages: apiMessages,
 					...(tools.length ? { tools } : {}),
@@ -1212,7 +1275,10 @@ class ChatView extends ItemView {
 							break;
 					}
 				},
+				signal,
 			);
+
+			if (signal?.aborted) { finalText = accText; break; }
 
 			const sortedBlocks = [...blockMap.entries()].sort((a, b) => a[0] - b[0]).map(([, b]) => b);
 			const contentBlocks: AnthropicContentBlock[] = sortedBlocks.map(b => {
@@ -1227,6 +1293,16 @@ class ChatView extends ItemView {
 				finalText = accText;
 				break;
 			}
+
+			// Show which tools are running before executing them
+			const toolNames = contentBlocks.filter(b => b.type === 'tool_use').map(b => (b as { name: string }).name);
+			const statusParts = toolNames.map(n => {
+				if (n === 'search_notes') return 'Searching notes';
+				if (n === 'create_notes') return 'Preparing note proposal';
+				if (n === 'modify_notes') return 'Preparing edit proposal';
+				return n;
+			});
+			onStatus(statusParts.join(' · ') + '…');
 
 			const toolResults: AnthropicContentBlock[] = [];
 			for (const block of contentBlocks) {
@@ -1254,6 +1330,8 @@ class ChatView extends ItemView {
 					const inp = block.input as { modifications: Array<{ path: string; operation: 'append' | 'edit'; content: string; heading?: string }> };
 					proposedModifications = inp.modifications.map(m => ({ path: m.path, operation: m.operation, content: m.content, heading: m.heading }));
 					toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: 'Proposals shown to user.' });
+				} else {
+					toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: `Unknown tool: ${block.name}` });
 				}
 			}
 			if (toolResults.length) apiMessages.push({ role: 'user', content: toolResults });
@@ -1265,6 +1343,8 @@ class ChatView extends ItemView {
 	private async callLiteLLM(
 		system: string, history: Message[], userMessage: string, _file: TFile | null,
 		onChunk: (text: string) => void,
+		onStatus: (text: string) => void,
+		signal?: AbortSignal,
 	): Promise<{ text: string; proposedCreates: CreateProposal[] | null; proposedModifications: Modification[] | null }> {
 		const { litellmBaseUrl, litellmApiKey, semanticResultCount } = this.plugin.settings;
 		const ec = this.plugin.embeddingConfig();
@@ -1298,7 +1378,7 @@ class ChatView extends ItemView {
 				litellmApiKey,
 				JSON.stringify({
 					model: this.plugin.settings.litellmChatModel,
-					max_tokens: turn === 0 ? 4096 : 1024,
+					max_tokens: 4096,
 					stream: true,
 					messages: oaiMessages,
 					...(tools.length ? { tools } : {}),
@@ -1327,7 +1407,10 @@ class ChatView extends ItemView {
 						}
 					}
 				},
+				signal,
 			);
+
+			if (signal?.aborted) { finalText = accText; break; }
 
 			const toolCalls = [...toolCallMap.entries()]
 				.sort((a, b) => a[0] - b[0])
@@ -1337,6 +1420,15 @@ class ChatView extends ItemView {
 				finalText = accText;
 				break;
 			}
+
+			// Show which tools are running before executing them
+			const statusParts = toolCalls.map(tc => {
+				if (tc.name === 'search_notes') return 'Searching notes';
+				if (tc.name === 'create_notes') return 'Preparing note proposal';
+				if (tc.name === 'modify_notes') return 'Preparing edit proposal';
+				return tc.name;
+			});
+			onStatus(statusParts.join(' · ') + '…');
 
 			// Push assistant message with tool calls into history
 			oaiMessages.push({
@@ -1371,6 +1463,8 @@ class ChatView extends ItemView {
 					const inp = parsed as { modifications: Array<{ path: string; operation: 'append' | 'edit'; content: string; heading?: string }> };
 					proposedModifications = inp.modifications.map(m => ({ path: m.path, operation: m.operation, content: m.content, heading: m.heading }));
 					result = 'Proposals shown to user.';
+				} else {
+					result = `Unknown tool: ${tc.name}`;
 				}
 
 				oaiMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
@@ -1717,16 +1811,24 @@ export default class KbChatPlugin extends Plugin {
 		this.addSettingTab(new KbChatSettingTab(this.app, this));
 
 		// Incremental index updates
+		const indexFile = async (file: TFile) => {
+			if (!this.canSearch()) return;
+			const ec = this.embeddingConfig();
+			const content = await this.app.vault.read(file);
+			await this.embeddingStore.update(file.path, file.stat.mtime, file.basename, content, ec.apiKey, ec.model, ec.baseUrl);
+		};
+
+		this.registerEvent(this.app.vault.on('create', (file) => {
+			if (file instanceof TFile && file.extension === 'md') indexFile(file);
+		}));
 		this.registerEvent(this.app.vault.on('modify', (file) => {
 			if (!(file instanceof TFile) || file.extension !== 'md') return;
 			if (!this.canSearch()) return;
 			const existing = this.updateTimers.get(file.path);
 			if (existing) clearTimeout(existing);
-			this.updateTimers.set(file.path, setTimeout(async () => {
+			this.updateTimers.set(file.path, setTimeout(() => {
 				this.updateTimers.delete(file.path);
-				const ec = this.embeddingConfig();
-				const content = await this.app.vault.read(file);
-				await this.embeddingStore.update(file.path, file.stat.mtime, file.basename, content, ec.apiKey, ec.model, ec.baseUrl);
+				indexFile(file);
 			}, 3000));
 		}));
 		this.registerEvent(this.app.vault.on('delete', (file) => {
@@ -1734,8 +1836,9 @@ export default class KbChatPlugin extends Plugin {
 				this.embeddingStore.remove(file.path);
 		}));
 		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-			if (file instanceof TFile && file.extension === 'md')
-				this.embeddingStore.remove(oldPath);
+			if (!(file instanceof TFile) || file.extension !== 'md') return;
+			this.embeddingStore.remove(oldPath);
+			indexFile(file);
 		}));
 
 		this.registerEvent(this.app.workspace.on('file-menu', (menu, file) => {

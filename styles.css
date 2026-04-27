@@ -415,16 +415,50 @@
   cursor: not-allowed;
 }
 
+.kb-input-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
 .kb-model-indicator {
   font-size: 11px;
   color: var(--text-faint);
   cursor: pointer;
   user-select: none;
-  align-self: flex-start;
 }
 
 .kb-model-indicator:hover {
   color: var(--text-muted);
+}
+
+.kb-stop-btn {
+  all: unset;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  user-select: none;
+}
+
+.kb-stop-btn:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.kb-stop-icon {
+  display: flex;
+  align-items: center;
+}
+
+.kb-stop-icon svg {
+  width: 10px;
+  height: 10px;
 }
 
 /* ── Semantic preview ───────────────────────────────────────── */

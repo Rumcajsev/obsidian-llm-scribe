@@ -39,10 +39,11 @@ var import_state = require("@codemirror/state");
 
 // src/embedding-store.ts
 var import_obsidian = require("obsidian");
-var SINGLE_THRESHOLD = 6e3;
-var CHUNK_MAX = 1500;
+var SINGLE_THRESHOLD = 1800;
+var CHUNK_TARGET = 1200;
+var CHUNK_MAX = 1800;
 var BATCH_SIZE = 50;
-var OVERLAP_CHARS = 75;
+var OVERLAP_CHARS = 150;
 function detectAttachments(content) {
   const re = /!?\[\[([^\]]+\.pdf)\]\]/gi;
   const found = [];
@@ -57,49 +58,94 @@ function makePrefix(basename, heading) {
 
 `;
 }
+function tailOverlap(text) {
+  const tail = text.slice(-OVERLAP_CHARS).trim();
+  const spaceIdx = tail.indexOf(" ");
+  return spaceIdx > 0 ? tail.slice(spaceIdx + 1) : tail;
+}
+function splitBySentence(text) {
+  const sentences = text.split(/(?<=[.!?])\s+(?=[A-Z])/);
+  const blocks = [];
+  let acc = "";
+  for (const s of sentences) {
+    const addLen = acc ? acc.length + 1 + s.length : s.length;
+    if (addLen > CHUNK_MAX && acc) {
+      blocks.push(acc.trim());
+      acc = s;
+    } else {
+      acc = acc ? acc + " " + s : s;
+    }
+  }
+  if (acc.trim()) blocks.push(acc.trim());
+  return blocks.length > 0 ? blocks : [text];
+}
+function accumulateBlocks(blocks, heading, prefix, out) {
+  let acc = "";
+  for (const block of blocks) {
+    if (!block.trim()) continue;
+    const addLen = acc ? acc.length + 2 + block.length : block.length;
+    if (addLen > CHUNK_TARGET && acc) {
+      out.push({ heading, text: prefix + acc.trim() });
+      const carry = tailOverlap(acc);
+      acc = carry ? carry + "\n\n" + block : block;
+    } else {
+      acc = acc ? acc + "\n\n" + block : block;
+    }
+  }
+  if (acc.trim()) out.push({ heading, text: prefix + acc.trim() });
+}
+function splitByParagraphs(body, heading, prefix, out) {
+  const blocks = [];
+  for (const para of body.split(/\n\n+/)) {
+    if (!para.trim()) continue;
+    if (para.length > CHUNK_MAX) {
+      blocks.push(...splitBySentence(para));
+    } else {
+      blocks.push(para);
+    }
+  }
+  accumulateBlocks(blocks, heading, prefix, out);
+}
+function splitSection(basename, heading, body, out) {
+  const prefix = makePrefix(basename, heading);
+  if (body.length <= CHUNK_MAX) {
+    out.push({ heading, text: prefix + body });
+    return;
+  }
+  const h45Parts = body.split(/(?=\n#{4,5} )/);
+  if (h45Parts.length > 1) {
+    for (const part of h45Parts) {
+      const sub = part.trim();
+      if (!sub) continue;
+      const nl = sub.indexOf("\n");
+      const firstLine = (nl >= 0 ? sub.slice(0, nl) : sub).trim();
+      const isH45 = /^#{4,5} /.test(firstLine);
+      const subHeading = isH45 ? heading ? `${heading} > ${firstLine.replace(/^#+\s+/, "")}` : firstLine.replace(/^#+\s+/, "") : heading;
+      const subPrefix = makePrefix(basename, subHeading);
+      if (sub.length <= CHUNK_MAX) {
+        out.push({ heading: subHeading, text: subPrefix + sub });
+      } else {
+        splitByParagraphs(sub, subHeading, subPrefix, out);
+      }
+    }
+    return;
+  }
+  splitByParagraphs(body, heading, prefix, out);
+}
 function chunkNote(basename, content) {
   if (content.length <= SINGLE_THRESHOLD) {
     return [{ heading: "", text: makePrefix(basename, "") + content }];
   }
-  const parts = content.split(/(?=\n#{2,3} )/);
-  const sections = [];
-  for (const part of parts) {
+  const out = [];
+  for (const part of content.split(/(?=\n#{2,3} )/)) {
     const body = part.trim();
     if (!body) continue;
     const nl = body.indexOf("\n");
     const firstLine = (nl >= 0 ? body.slice(0, nl) : body).trim();
-    const isHeading = /^#{2,3} /.test(firstLine);
-    sections.push({
-      heading: isHeading ? firstLine.replace(/^#+\s+/, "") : "",
-      body
-    });
+    const heading = /^#{2,3} /.test(firstLine) ? firstLine.replace(/^#+\s+/, "") : "";
+    splitSection(basename, heading, body, out);
   }
-  const chunks = [];
-  for (const sec of sections) {
-    if (!sec.body.trim()) continue;
-    const prefix = makePrefix(basename, sec.heading);
-    if (sec.body.length <= CHUNK_MAX) {
-      chunks.push({ heading: sec.heading, text: prefix + sec.body });
-      continue;
-    }
-    const paras = sec.body.split(/\n\n+/);
-    let acc = "";
-    let overlap = "";
-    for (const para of paras) {
-      const addLen = acc ? acc.length + 2 + para.length : para.length;
-      if (addLen > CHUNK_MAX && acc.length > 0) {
-        chunks.push({ heading: sec.heading, text: prefix + acc.trim() });
-        const tail = acc.slice(-OVERLAP_CHARS).trim();
-        const spaceIdx = tail.indexOf(" ");
-        overlap = spaceIdx > 0 ? tail.slice(spaceIdx + 1) : tail;
-        acc = overlap ? overlap + "\n\n" + para : para;
-      } else {
-        acc = acc ? acc + "\n\n" + para : para;
-      }
-    }
-    if (acc.trim()) chunks.push({ heading: sec.heading, text: prefix + acc.trim() });
-  }
-  return chunks.length > 0 ? chunks : [{ heading: "", text: makePrefix(basename, "") + content.slice(0, SINGLE_THRESHOLD) }];
+  return out.length > 0 ? out : [{ heading: "", text: makePrefix(basename, "") + content.slice(0, CHUNK_MAX) }];
 }
 function cosineSim(a, b) {
   let dot = 0, na = 0, nb = 0;
@@ -265,8 +311,12 @@ var DEFAULT_SETTINGS = {
   voyageModel: "voyage-3-lite",
   semanticResultCount: 7
 };
-function anthropicStream(apiKey, body, onEvent) {
+function anthropicStream(apiKey, body, onEvent, signal) {
   return new Promise((resolve, reject) => {
+    if (signal == null ? void 0 : signal.aborted) {
+      resolve();
+      return;
+    }
     const req = https.request({
       hostname: "api.anthropic.com",
       port: 443,
@@ -311,15 +361,29 @@ function anthropicStream(apiKey, body, onEvent) {
         }
       });
       res.on("end", resolve);
-      res.on("error", reject);
+      res.on("error", (err) => {
+        if (signal == null ? void 0 : signal.aborted) resolve();
+        else reject(err);
+      });
     });
-    req.on("error", reject);
+    signal == null ? void 0 : signal.addEventListener("abort", () => {
+      req.destroy();
+      resolve();
+    });
+    req.on("error", (err) => {
+      if (signal == null ? void 0 : signal.aborted) resolve();
+      else reject(err);
+    });
     req.write(body);
     req.end();
   });
 }
-function openaiStream(baseUrl, apiKey, body, onEvent) {
+function openaiStream(baseUrl, apiKey, body, onEvent, signal) {
   return new Promise((resolve, reject) => {
+    if (signal == null ? void 0 : signal.aborted) {
+      resolve();
+      return;
+    }
     const url = new URL("/chat/completions", baseUrl.replace(/\/$/, ""));
     const isHttps = url.protocol === "https:";
     const transport = isHttps ? https : http;
@@ -366,9 +430,19 @@ function openaiStream(baseUrl, apiKey, body, onEvent) {
         }
       });
       res.on("end", resolve);
-      res.on("error", reject);
+      res.on("error", (err) => {
+        if (signal == null ? void 0 : signal.aborted) resolve();
+        else reject(err);
+      });
     });
-    req.on("error", reject);
+    signal == null ? void 0 : signal.addEventListener("abort", () => {
+      req.destroy();
+      resolve();
+    });
+    req.on("error", (err) => {
+      if (signal == null ? void 0 : signal.aborted) resolve();
+      else reject(err);
+    });
     req.write(body);
     req.end();
   });
@@ -482,7 +556,7 @@ var ANTHROPIC_SEARCH_TOOL = {
 };
 var ANTHROPIC_CREATE_TOOL = {
   name: "create_notes",
-  description: "Propose creating one or more new notes in the vault. Call this tool directly \u2014 do not describe the creation in text. Always use search_notes first to check no suitable note already exists. Each item is shown as a separate proposal for the user to confirm individually.",
+  description: "Propose creating one or more new notes in the vault. Each item is shown as a separate proposal for the user to confirm individually.",
   input_schema: {
     type: "object",
     properties: {
@@ -504,7 +578,7 @@ var ANTHROPIC_CREATE_TOOL = {
 };
 var ANTHROPIC_MODIFY_TOOL = {
   name: "modify_notes",
-  description: 'Propose appending content to or editing one or more existing notes. Call this tool directly \u2014 do not describe the action in text. Use search_notes first to identify the right notes. Each item is shown as a separate proposal for the user to confirm individually. Use "append" to add new content without touching existing content. Use "edit" only when existing content needs to change \u2014 the user will see a diff and the full note will be replaced, so use it carefully.',
+  description: 'Propose appending content to or editing one or more existing notes. Each item is shown as a separate proposal for the user to confirm individually. Use "append" to add new content without touching existing content. Use "edit" only when existing content needs to change \u2014 the user will see a diff and the full note will be replaced, so use it carefully.',
   input_schema: {
     type: "object",
     properties: {
@@ -525,6 +599,16 @@ var ANTHROPIC_MODIFY_TOOL = {
     required: ["modifications"]
   }
 };
+var HISTORY_CHAR_LIMIT = 4e4;
+function trimHistory(messages) {
+  let total = messages.reduce((sum, m) => sum + m.content.length, 0);
+  let start = 0;
+  while (total > HISTORY_CHAR_LIMIT && start + 1 < messages.length) {
+    total -= messages[start].content.length + messages[start + 1].content.length;
+    start += 2;
+  }
+  return messages.slice(start);
+}
 function appendToSection(noteContent, heading, newContent) {
   const trimmed = noteContent.trimEnd();
   if (!heading) return trimmed + "\n\n" + newContent;
@@ -552,6 +636,7 @@ var ChatView = class extends import_obsidian2.ItemView {
     super(leaf);
     this.messages = [];
     this.isBusy = false;
+    this.abortController = null;
     this.activeFilePath = null;
     this.currentSessionPath = null;
     this.currentNotePath = null;
@@ -611,9 +696,18 @@ var ChatView = class extends import_obsidian2.ItemView {
         this.sendMessage();
       }
     });
-    this.modelIndicatorEl = inputArea.createDiv("kb-model-indicator");
+    const inputFooter = inputArea.createDiv("kb-input-footer");
+    this.modelIndicatorEl = inputFooter.createDiv("kb-model-indicator");
     this.updateModelIndicator();
     this.modelIndicatorEl.addEventListener("click", (e) => this.openModelMenu(e));
+    this.stopBtnEl = inputFooter.createEl("button", { cls: "kb-stop-btn" });
+    (0, import_obsidian2.setIcon)(this.stopBtnEl.createSpan("kb-stop-icon"), "square");
+    this.stopBtnEl.createSpan({ text: "Stop" });
+    this.stopBtnEl.style.display = "none";
+    this.stopBtnEl.addEventListener("click", () => {
+      var _a;
+      return (_a = this.abortController) == null ? void 0 : _a.abort();
+    });
   }
   // ── Session management ────────────────────────────────────────────────────
   async switchToNote(file) {
@@ -923,25 +1017,16 @@ Assistant: ${assistantMsg}`;
     const base = this.plugin.settings.basePrompt.trim() || DEFAULT_SETTINGS.basePrompt;
     const contextBlocks = await Promise.all(this.contextFiles.map(async (f) => {
       const content = await this.app.vault.read(f);
-      return `## ${f.basename}
+      return `## ${f.basename} (path: ${f.path})
 
 ${content}`;
     }));
     const multi = this.contextFiles.length > 1;
-    let editHint = "";
-    if (this.contextFiles.length >= 1) {
-      const mode = this.plugin.settings.editMode;
-      if (mode === "on_request") {
-        editHint = " Only use the modify_notes tool to edit notes when the user explicitly asks you to edit or update them.";
-      } else if (mode === "proactive") {
-        editHint = " You may proactively propose edits using the modify_notes tool when the conversation produces something clearly worth capturing: a decision reached, a significant refinement of an idea, a new section that naturally extends a note, or an action item that emerged. Do not suggest edits for minor clarifications or conversational exchanges.";
-      }
-    }
     let prompt = contextBlocks.length ? `${base} The user has the following note${multi ? "s" : ""} as context:
 
 ${contextBlocks.join("\n\n---\n\n")}
 
-Help them think through ideas.${editHint}` : base;
+Help them think through ideas.` : base;
     if (semanticHits.length > 0) {
       const byNote = /* @__PURE__ */ new Map();
       for (const hit of semanticHits) {
@@ -955,7 +1040,7 @@ Help them think through ideas.${editHint}` : base;
         const sections = hits.map((h) => h.heading ? `### ${h.heading}
 
 ${h.text}` : h.text).join("\n\n");
-        return `## ${file.basename}
+        return `## ${file.basename} (path: ${path})
 
 ${sections}`;
       }))).filter(Boolean);
@@ -964,48 +1049,65 @@ ${sections}`;
 
 ---
 
-Potentially related notes (retrieved by semantic search \u2014 reference if relevant, suggest [[wikilinks]] where appropriate):
+Relevant notes from the vault (pre-fetched \u2014 use these directly to answer questions or identify notes to modify; only call search_notes if you need something not already shown here):
 
 ${relatedBlocks.join("\n\n---\n\n")}`;
     }
     const canSearch = this.plugin.canSearch();
-    if (canSearch)
-      prompt += " Use the search_notes tool when the user's question might be answered by their notes, or before creating or appending to a note.";
     const createMode = this.plugin.settings.createMode;
     const editMode = this.plugin.settings.editMode;
     const appendMode = this.plugin.settings.appendMode;
     const canCreate = createMode !== "never";
-    const canModify = editMode !== "never" || appendMode !== "never";
-    if (canCreate || canModify) {
+    const canAppend = appendMode !== "never";
+    const canEdit = editMode !== "never";
+    if (canCreate || canAppend || canEdit) {
       const currentFolder = (_b = (_a = this.contextFiles[0]) == null ? void 0 : _a.parent) == null ? void 0 : _b.path;
       const folderHint = currentFolder ? ` Default new notes to the "${currentFolder}" folder unless context suggests a better location.` : "";
-      const isProactive = createMode === "proactive" || editMode === "proactive" || appendMode === "proactive";
-      const trigger = isProactive ? "When the conversation produces something worth saving" : "When the user asks to save something";
-      let hint = ` ${trigger}, always use search_notes first, then immediately call the appropriate tool \u2014 no text between the search result and the tool call.`;
-      if (canModify && canCreate)
-        hint += ` Use modify_notes to append or edit existing notes (prefer append unless content must change), or create_notes if no suitable note exists.`;
-      else if (canModify)
-        hint += ` Use modify_notes to append or edit existing notes \u2014 prefer append unless existing content must change.`;
-      else
-        hint += ` Use create_notes if no suitable note exists.`;
-      hint += ` Never write text that describes or announces what you are about to do with a tool \u2014 do not say "I'll create", "Creating now", "No existing note, so I will\u2026" or anything similar. Call the tool directly, then write any explanatory text after.${folderHint}`;
-      prompt += hint;
+      const rules = [];
+      if (canAppend) {
+        rules.push(appendMode === "proactive" ? 'Use modify_notes (operation "append") when the conversation produces content clearly worth adding to an existing note \u2014 a decision, a key insight, or an action item. Prefer append over edit whenever possible.' : 'Use modify_notes (operation "append") only when the user explicitly asks to add content to a note. Prefer append over edit whenever possible.');
+      }
+      if (canEdit) {
+        rules.push(editMode === "proactive" ? 'Use modify_notes (operation "edit") when existing note content needs meaningful revision based on what was discussed. Use sparingly \u2014 it replaces the entire note.' : 'Use modify_notes (operation "edit") only when the user explicitly asks to edit or rewrite a note. It replaces the entire note, so use it carefully.');
+      }
+      if (canCreate) {
+        rules.push(createMode === "proactive" ? "Use create_notes when the conversation produces something worth capturing as a new standalone note and no suitable note exists yet." : "Use create_notes only when the user explicitly asks to create a new note and no suitable note exists yet.");
+      }
+      if (canSearch) {
+        rules.push("If the pre-fetched notes above don't fully answer the user's question, use search_notes to broaden the search.");
+        if (canAppend || canEdit)
+          rules.push("Before calling modify_notes, use the path shown in the note heading above if the note is already in context. Otherwise call search_notes first to get the exact vault path \u2014 it must not be guessed.");
+        if (canCreate)
+          rules.push("Before calling create_notes, call search_notes to confirm no suitable note already exists.");
+        rules.push("Call the appropriate tool immediately after search_notes \u2014 no text in between.");
+      }
+      rules.push(`Never write text announcing what you are about to do with a tool \u2014 do not say "I'll create", "Creating now", or anything similar. Call the tool directly, then write any explanatory text after.${folderHint}`);
+      prompt += "\n\nNote-writing rules:\n" + rules.map((r) => `- ${r}`).join("\n");
+    } else if (canSearch) {
+      if (semanticHits.length > 0) {
+        prompt += " Relevant notes are already provided above \u2014 answer from them directly. Use search_notes only if you need something not covered there.";
+      } else {
+        prompt += " Use the search_notes tool when the user's question might be answered by their notes.";
+      }
     }
     return prompt;
   }
   renderSemanticPreview(hits, msgEl) {
-    const seen = /* @__PURE__ */ new Set();
-    const files = [];
+    const byPath = /* @__PURE__ */ new Map();
     for (const hit of hits) {
-      if (seen.has(hit.path)) continue;
-      seen.add(hit.path);
-      const file = this.app.vault.getAbstractFileByPath(hit.path);
-      if (file instanceof import_obsidian2.TFile) files.push(file);
+      const arr = byPath.get(hit.path);
+      if (arr) arr.push(hit);
+      else byPath.set(hit.path, [hit]);
     }
-    if (!files.length) return;
+    const entries = [];
+    for (const [path, chunks] of byPath) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (file instanceof import_obsidian2.TFile) entries.push({ file, chunks });
+    }
+    if (!entries.length) return;
     let open = false;
     const indicator = msgEl.createDiv("kb-semantic-indicator");
-    indicator.setText(`${files.length} related`);
+    indicator.setText(`${entries.length} related`);
     const list = msgEl.createDiv("kb-semantic-list");
     list.style.display = "none";
     indicator.addEventListener("click", () => {
@@ -1013,13 +1115,19 @@ ${relatedBlocks.join("\n\n---\n\n")}`;
       list.style.display = open ? "" : "none";
       indicator.toggleClass("is-open", open);
     });
-    for (const file of files) {
+    for (const { file, chunks } of entries) {
       const row = list.createDiv("kb-semantic-item");
       const nameEl = row.createSpan({ text: file.basename, cls: "kb-semantic-name" });
       nameEl.addEventListener(
         "click",
         () => this.app.workspace.openLinkText(file.path, "", false)
       );
+      const tooltipLines = chunks.map((c) => {
+        if (c.heading) return `\u203A ${c.heading}`;
+        const preview = c.text.replace(/\s+/g, " ").trim().slice(0, 60);
+        return `\u203A ${preview}${c.text.length > 60 ? "\u2026" : ""}`;
+      });
+      nameEl.setAttribute("title", tooltipLines.join("\n"));
       const addBtn = row.createEl("button", { cls: "kb-semantic-add", attr: { title: "Add to context" } });
       (0, import_obsidian2.setIcon)(addBtn, "plus");
       addBtn.addEventListener("click", () => {
@@ -1083,11 +1191,23 @@ ${relatedBlocks.join("\n\n---\n\n")}`;
     this.messagesEl.scrollTo({ top: userMsgEl.offsetTop - 12, behavior: "smooth" });
     this.isBusy = true;
     this.inputEl.disabled = true;
+    this.abortController = new AbortController();
+    this.stopBtnEl.style.display = "";
     try {
       const caller = this.plugin.settings.provider === "litellm" ? this.callLiteLLM.bind(this) : this.callAnthropic.bind(this);
-      const { text: reply, proposedCreates, proposedModifications } = await caller(system, this.messages.slice(0, -1), text, editableFile, (chunk) => {
-        this.renderMarkdownTo(textEl, chunk);
-      });
+      const { text: reply, proposedCreates, proposedModifications } = await caller(
+        system,
+        trimHistory(this.messages.slice(0, -1)),
+        text,
+        editableFile,
+        (chunk) => {
+          this.renderMarkdownTo(textEl, chunk);
+        },
+        (status) => {
+          textEl.setText(status);
+        },
+        this.abortController.signal
+      );
       const timestamp = Date.now();
       stampEl.setText(this.formatStamp(timestamp));
       const hasProposal = (proposedCreates == null ? void 0 : proposedCreates.length) || (proposedModifications == null ? void 0 : proposedModifications.length);
@@ -1097,7 +1217,8 @@ ${relatedBlocks.join("\n\n---\n\n")}`;
         this.messages.push({ role: "assistant", content: displayText, timestamp });
         await this.saveSession();
       } else {
-        textEl.empty();
+        if (reply) this.renderMarkdownTo(textEl, reply);
+        else textEl.empty();
         this.messages.push({ role: "assistant", content: reply, timestamp });
         await this.saveSession();
         if (proposedCreates == null ? void 0 : proposedCreates.length) {
@@ -1189,11 +1310,13 @@ ${pc.content}`.trimEnd();
       textEl.setText(`Error: ${msg}`);
     } finally {
       this.isBusy = false;
+      this.abortController = null;
+      this.stopBtnEl.style.display = "none";
       this.inputEl.disabled = false;
       this.inputEl.focus();
     }
   }
-  async callAnthropic(system, history, userMessage, file, onChunk) {
+  async callAnthropic(system, history, userMessage, file, onChunk, onStatus, signal) {
     const apiMessages = [
       ...history.map((m) => ({ role: m.role, content: m.content })),
       { role: "user", content: userMessage }
@@ -1218,7 +1341,7 @@ ${pc.content}`.trimEnd();
         this.plugin.settings.anthropicApiKey,
         JSON.stringify({
           model: this.plugin.settings.anthropicModel,
-          max_tokens: turn === 0 ? 4096 : 1024,
+          max_tokens: 4096,
           stream: true,
           system,
           messages: apiMessages,
@@ -1250,8 +1373,13 @@ ${pc.content}`.trimEnd();
               if ((_e = ev.delta) == null ? void 0 : _e.stop_reason) stopReason = ev.delta.stop_reason;
               break;
           }
-        }
+        },
+        signal
       );
+      if (signal == null ? void 0 : signal.aborted) {
+        finalText = accText;
+        break;
+      }
       const sortedBlocks = [...blockMap.entries()].sort((a, b) => a[0] - b[0]).map(([, b]) => b);
       const contentBlocks = sortedBlocks.map((b) => {
         if (b.type === "text") return { type: "text", text: b.text };
@@ -1267,6 +1395,14 @@ ${pc.content}`.trimEnd();
         finalText = accText;
         break;
       }
+      const toolNames = contentBlocks.filter((b) => b.type === "tool_use").map((b) => b.name);
+      const statusParts = toolNames.map((n) => {
+        if (n === "search_notes") return "Searching notes";
+        if (n === "create_notes") return "Preparing note proposal";
+        if (n === "modify_notes") return "Preparing edit proposal";
+        return n;
+      });
+      onStatus(statusParts.join(" \xB7 ") + "\u2026");
       const toolResults = [];
       for (const block of contentBlocks) {
         if (block.type !== "tool_use") continue;
@@ -1295,13 +1431,15 @@ ${pc.content}`.trimEnd();
           const inp = block.input;
           proposedModifications = inp.modifications.map((m) => ({ path: m.path, operation: m.operation, content: m.content, heading: m.heading }));
           toolResults.push({ type: "tool_result", tool_use_id: block.id, content: "Proposals shown to user." });
+        } else {
+          toolResults.push({ type: "tool_result", tool_use_id: block.id, content: `Unknown tool: ${block.name}` });
         }
       }
       if (toolResults.length) apiMessages.push({ role: "user", content: toolResults });
     }
     return { text: finalText, proposedCreates, proposedModifications };
   }
-  async callLiteLLM(system, history, userMessage, _file, onChunk) {
+  async callLiteLLM(system, history, userMessage, _file, onChunk, onStatus, signal) {
     const { litellmBaseUrl, litellmApiKey, semanticResultCount } = this.plugin.settings;
     const ec = this.plugin.embeddingConfig();
     const canSearch = this.plugin.canSearch();
@@ -1329,7 +1467,7 @@ ${pc.content}`.trimEnd();
         litellmApiKey,
         JSON.stringify({
           model: this.plugin.settings.litellmChatModel,
-          max_tokens: turn === 0 ? 4096 : 1024,
+          max_tokens: 4096,
           stream: true,
           messages: oaiMessages,
           ...tools.length ? { tools } : {}
@@ -1358,13 +1496,25 @@ ${pc.content}`.trimEnd();
               }
             }
           }
-        }
+        },
+        signal
       );
+      if (signal == null ? void 0 : signal.aborted) {
+        finalText = accText;
+        break;
+      }
       const toolCalls = [...toolCallMap.entries()].sort((a, b) => a[0] - b[0]).map(([, tc]) => tc);
       if (finishReason !== "tool_calls" || toolCalls.length === 0) {
         finalText = accText;
         break;
       }
+      const statusParts = toolCalls.map((tc) => {
+        if (tc.name === "search_notes") return "Searching notes";
+        if (tc.name === "create_notes") return "Preparing note proposal";
+        if (tc.name === "modify_notes") return "Preparing edit proposal";
+        return tc.name;
+      });
+      onStatus(statusParts.join(" \xB7 ") + "\u2026");
       oaiMessages.push({
         role: "assistant",
         content: accText || null,
@@ -1400,6 +1550,8 @@ ${pc.content}`.trimEnd();
           const inp = parsed;
           proposedModifications = inp.modifications.map((m) => ({ path: m.path, operation: m.operation, content: m.content, heading: m.heading }));
           result = "Proposals shown to user.";
+        } else {
+          result = `Unknown tool: ${tc.name}`;
         }
         oaiMessages.push({ role: "tool", tool_call_id: tc.id, content: result });
       }
@@ -1691,16 +1843,23 @@ var KbChatPlugin = class extends import_obsidian2.Plugin {
       }
     });
     this.addSettingTab(new KbChatSettingTab(this.app, this));
+    const indexFile = async (file) => {
+      if (!this.canSearch()) return;
+      const ec = this.embeddingConfig();
+      const content = await this.app.vault.read(file);
+      await this.embeddingStore.update(file.path, file.stat.mtime, file.basename, content, ec.apiKey, ec.model, ec.baseUrl);
+    };
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (file instanceof import_obsidian2.TFile && file.extension === "md") indexFile(file);
+    }));
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (!(file instanceof import_obsidian2.TFile) || file.extension !== "md") return;
       if (!this.canSearch()) return;
       const existing = this.updateTimers.get(file.path);
       if (existing) clearTimeout(existing);
-      this.updateTimers.set(file.path, setTimeout(async () => {
+      this.updateTimers.set(file.path, setTimeout(() => {
         this.updateTimers.delete(file.path);
-        const ec = this.embeddingConfig();
-        const content = await this.app.vault.read(file);
-        await this.embeddingStore.update(file.path, file.stat.mtime, file.basename, content, ec.apiKey, ec.model, ec.baseUrl);
+        indexFile(file);
       }, 3e3));
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
@@ -1708,8 +1867,9 @@ var KbChatPlugin = class extends import_obsidian2.Plugin {
         this.embeddingStore.remove(file.path);
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-      if (file instanceof import_obsidian2.TFile && file.extension === "md")
-        this.embeddingStore.remove(oldPath);
+      if (!(file instanceof import_obsidian2.TFile) || file.extension !== "md") return;
+      this.embeddingStore.remove(oldPath);
+      indexFile(file);
     }));
     this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
       if (!(file instanceof import_obsidian2.TFile) || file.extension !== "md") return;
