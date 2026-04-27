@@ -32,6 +32,8 @@ interface KbChatSettings {
 	anthropicModel: string;
 	litellmBaseUrl: string;
 	litellmApiKey: string;
+	litellmChatModel: string;
+	litellmEmbedModel: string;
 	shiftEnterToSend: boolean;
 	basePrompt: string;
 	editMode: EditMode;
@@ -48,6 +50,8 @@ const DEFAULT_SETTINGS: KbChatSettings = {
 	anthropicModel: 'claude-sonnet-4-6',
 	litellmBaseUrl: 'http://localhost:4000',
 	litellmApiKey: '',
+	litellmChatModel: '',
+	litellmEmbedModel: '',
 	shiftEnterToSend: false,
 	basePrompt: 'You are a helpful thinking partner.',
 	editMode: 'on_request',
@@ -720,7 +724,7 @@ class ChatView extends ItemView {
 		const assistantMsg = this.messages[1].content.slice(0, 500);
 		const prompt = `Summarize this conversation in 4-7 words as a chat title. Reply with only the title, no quotes or trailing punctuation.\n\nUser: ${userMsg}\n\nAssistant: ${assistantMsg}`;
 
-		const { provider, anthropicApiKey, anthropicModel, litellmBaseUrl, litellmApiKey } = this.plugin.settings;
+		const { provider, anthropicApiKey, anthropicModel, litellmBaseUrl, litellmApiKey, litellmChatModel } = this.plugin.settings;
 		try {
 			let title = '';
 			if (provider === 'litellm') {
@@ -731,7 +735,7 @@ class ChatView extends ItemView {
 						...(litellmApiKey ? { 'Authorization': `Bearer ${litellmApiKey}` } : {}),
 						'content-type': 'application/json',
 					},
-					body: JSON.stringify({ model: anthropicModel, max_tokens: 30, messages: [{ role: 'user', content: prompt }] }),
+					body: JSON.stringify({ model: litellmChatModel, max_tokens: 30, messages: [{ role: 'user', content: prompt }] }),
 					throw: false,
 				});
 				if (resp.status !== 200) return;
@@ -966,9 +970,13 @@ class ChatView extends ItemView {
 	}
 
 	private updateModelIndicator() {
-		const { anthropicModel } = this.plugin.settings;
-		const label = ANTHROPIC_MODELS[anthropicModel] ?? anthropicModel;
-		this.modelIndicatorEl.setText(`Claude ${label} ▾`);
+		const { provider, anthropicModel, litellmChatModel } = this.plugin.settings;
+		if (provider === 'litellm') {
+			this.modelIndicatorEl.setText(`${litellmChatModel || 'LiteLLM'} ▾`);
+		} else {
+			const label = ANTHROPIC_MODELS[anthropicModel] ?? anthropicModel;
+			this.modelIndicatorEl.setText(`Claude ${label} ▾`);
+		}
 	}
 
 	private openModelMenu(e: MouseEvent) {
@@ -1289,7 +1297,7 @@ class ChatView extends ItemView {
 				litellmBaseUrl,
 				litellmApiKey,
 				JSON.stringify({
-					model: this.plugin.settings.anthropicModel,
+					model: this.plugin.settings.litellmChatModel,
 					max_tokens: turn === 0 ? 4096 : 1024,
 					stream: true,
 					messages: oaiMessages,
@@ -1797,14 +1805,14 @@ export default class KbChatPlugin extends Plugin {
 	}
 
 	embeddingConfig(): { apiKey: string; model: string; baseUrl?: string } {
-		const { provider, voyageApiKey, voyageModel, litellmBaseUrl, litellmApiKey } = this.settings;
-		if (provider === 'litellm') return { apiKey: litellmApiKey, model: voyageModel, baseUrl: litellmBaseUrl };
+		const { provider, voyageApiKey, voyageModel, litellmBaseUrl, litellmApiKey, litellmEmbedModel } = this.settings;
+		if (provider === 'litellm') return { apiKey: litellmApiKey, model: litellmEmbedModel || voyageModel, baseUrl: litellmBaseUrl };
 		return { apiKey: voyageApiKey, model: voyageModel };
 	}
 
 	canSearch(): boolean {
-		const { provider, voyageApiKey, litellmBaseUrl } = this.settings;
-		const hasCredentials = provider === 'litellm' ? !!litellmBaseUrl : !!voyageApiKey;
+		const { provider, voyageApiKey, litellmBaseUrl, litellmEmbedModel } = this.settings;
+		const hasCredentials = provider === 'litellm' ? (!!litellmBaseUrl && !!litellmEmbedModel) : !!voyageApiKey;
 		return hasCredentials && this.embeddingStore.isIndexed();
 	}
 
@@ -1965,16 +1973,77 @@ class KbChatSettingTab extends PluginSettingTab {
 						.onChange(async (v) => { this.plugin.settings.litellmApiKey = v.trim(); await this.plugin.saveSettings(); })
 				);
 
+			// Model fetch + selection
+			const modelSection = containerEl.createDiv();
+			const renderModelSelectors = (allModels: string[]) => {
+				modelSection.empty();
+				const chatModels = allModels.filter(m => !/(embed|voyage|rerank)/i.test(m));
+				const embedModels = allModels.filter(m => /(embed|voyage)/i.test(m));
+
+				new Setting(modelSection)
+					.setName('Chat model')
+					.addDropdown(drop => {
+						if (chatModels.length === 0) drop.addOption('', '— fetch models first —');
+						for (const m of chatModels) drop.addOption(m, m);
+						if (this.plugin.settings.litellmChatModel && !chatModels.includes(this.plugin.settings.litellmChatModel))
+							drop.addOption(this.plugin.settings.litellmChatModel, this.plugin.settings.litellmChatModel);
+						drop.setValue(this.plugin.settings.litellmChatModel);
+						drop.onChange(async (v) => {
+							this.plugin.settings.litellmChatModel = v;
+							await this.plugin.saveSettings();
+						});
+					});
+
+				new Setting(modelSection)
+					.setName('Embedding model')
+					.addDropdown(drop => {
+						if (embedModels.length === 0) drop.addOption('', '— fetch models first —');
+						for (const m of embedModels) drop.addOption(m, m);
+						if (this.plugin.settings.litellmEmbedModel && !embedModels.includes(this.plugin.settings.litellmEmbedModel))
+							drop.addOption(this.plugin.settings.litellmEmbedModel, this.plugin.settings.litellmEmbedModel);
+						drop.setValue(this.plugin.settings.litellmEmbedModel);
+						drop.onChange(async (v) => {
+							this.plugin.settings.litellmEmbedModel = v;
+							await this.plugin.saveSettings();
+						});
+					});
+			};
+
+			// Render with any previously saved models (empty on first load)
+			const savedChat = this.plugin.settings.litellmChatModel;
+			const savedEmbed = this.plugin.settings.litellmEmbedModel;
+			const seedModels = [...new Set([savedChat, savedEmbed].filter(Boolean))];
+			renderModelSelectors(seedModels);
+
 			new Setting(containerEl)
-				.setName('Model')
-				.setDesc('Uses the same model selection as Anthropic above.')
-				.addDropdown(drop => {
-					for (const [id, label] of Object.entries(ANTHROPIC_MODELS)) drop.addOption(id, 'Claude ' + label);
-					if (!(this.plugin.settings.anthropicModel in ANTHROPIC_MODELS))
-						drop.addOption(this.plugin.settings.anthropicModel, this.plugin.settings.anthropicModel);
-					drop.setValue(this.plugin.settings.anthropicModel);
-					drop.onChange(async (v) => { this.plugin.settings.anthropicModel = v; await this.plugin.saveSettings(); });
-				});
+				.setName('Available models')
+				.setDesc('Fetch the list of models from your LiteLLM instance.')
+				.addButton(btn =>
+					btn.setButtonText('Fetch models').onClick(async () => {
+						const { litellmBaseUrl, litellmApiKey } = this.plugin.settings;
+						if (!litellmBaseUrl) { new Notice('Enter a LiteLLM base URL first.'); return; }
+						btn.setButtonText('Fetching…');
+						btn.setDisabled(true);
+						try {
+							const resp = await requestUrl({
+								url: `${litellmBaseUrl.replace(/\/$/, '')}/v1/models`,
+								method: 'GET',
+								headers: { ...(litellmApiKey ? { 'Authorization': `Bearer ${litellmApiKey}` } : {}) },
+								throw: false,
+							});
+							if (resp.status !== 200) throw new Error(`HTTP ${resp.status}`);
+							const data = resp.json as { data: Array<{ id: string }> };
+							const models = data.data.map(m => m.id).sort();
+							renderModelSelectors(models);
+							new Notice(`Fetched ${models.length} models.`);
+						} catch (e) {
+							new Notice(`Failed to fetch models: ${e instanceof Error ? e.message : String(e)}`);
+						} finally {
+							btn.setButtonText('Fetch models');
+							btn.setDisabled(false);
+						}
+					})
+				);
 		}
 
 		containerEl.createEl('h3', { text: 'Semantic search (Voyage AI)' });

@@ -254,6 +254,8 @@ var DEFAULT_SETTINGS = {
   anthropicModel: "claude-sonnet-4-6",
   litellmBaseUrl: "http://localhost:4000",
   litellmApiKey: "",
+  litellmChatModel: "",
+  litellmEmbedModel: "",
   shiftEnterToSend: false,
   basePrompt: "You are a helpful thinking partner.",
   editMode: "on_request",
@@ -807,7 +809,7 @@ ${msgs}` : msgs;
 User: ${userMsg}
 
 Assistant: ${assistantMsg}`;
-    const { provider, anthropicApiKey, anthropicModel, litellmBaseUrl, litellmApiKey } = this.plugin.settings;
+    const { provider, anthropicApiKey, anthropicModel, litellmBaseUrl, litellmApiKey, litellmChatModel } = this.plugin.settings;
     try {
       let title = "";
       if (provider === "litellm") {
@@ -818,7 +820,7 @@ Assistant: ${assistantMsg}`;
             ...litellmApiKey ? { "Authorization": `Bearer ${litellmApiKey}` } : {},
             "content-type": "application/json"
           },
-          body: JSON.stringify({ model: anthropicModel, max_tokens: 30, messages: [{ role: "user", content: prompt }] }),
+          body: JSON.stringify({ model: litellmChatModel, max_tokens: 30, messages: [{ role: "user", content: prompt }] }),
           throw: false
         });
         if (resp.status !== 200) return;
@@ -1030,9 +1032,13 @@ ${relatedBlocks.join("\n\n---\n\n")}`;
   }
   updateModelIndicator() {
     var _a;
-    const { anthropicModel } = this.plugin.settings;
-    const label = (_a = ANTHROPIC_MODELS[anthropicModel]) != null ? _a : anthropicModel;
-    this.modelIndicatorEl.setText(`Claude ${label} \u25BE`);
+    const { provider, anthropicModel, litellmChatModel } = this.plugin.settings;
+    if (provider === "litellm") {
+      this.modelIndicatorEl.setText(`${litellmChatModel || "LiteLLM"} \u25BE`);
+    } else {
+      const label = (_a = ANTHROPIC_MODELS[anthropicModel]) != null ? _a : anthropicModel;
+      this.modelIndicatorEl.setText(`Claude ${label} \u25BE`);
+    }
   }
   openModelMenu(e) {
     const currentModel = this.plugin.settings.anthropicModel;
@@ -1322,7 +1328,7 @@ ${pc.content}`.trimEnd();
         litellmBaseUrl,
         litellmApiKey,
         JSON.stringify({
-          model: this.plugin.settings.anthropicModel,
+          model: this.plugin.settings.litellmChatModel,
           max_tokens: turn === 0 ? 4096 : 1024,
           stream: true,
           messages: oaiMessages,
@@ -1763,13 +1769,13 @@ var KbChatPlugin = class extends import_obsidian2.Plugin {
     if (view instanceof ChatHistoryView) await view.refresh();
   }
   embeddingConfig() {
-    const { provider, voyageApiKey, voyageModel, litellmBaseUrl, litellmApiKey } = this.settings;
-    if (provider === "litellm") return { apiKey: litellmApiKey, model: voyageModel, baseUrl: litellmBaseUrl };
+    const { provider, voyageApiKey, voyageModel, litellmBaseUrl, litellmApiKey, litellmEmbedModel } = this.settings;
+    if (provider === "litellm") return { apiKey: litellmApiKey, model: litellmEmbedModel || voyageModel, baseUrl: litellmBaseUrl };
     return { apiKey: voyageApiKey, model: voyageModel };
   }
   canSearch() {
-    const { provider, voyageApiKey, litellmBaseUrl } = this.settings;
-    const hasCredentials = provider === "litellm" ? !!litellmBaseUrl : !!voyageApiKey;
+    const { provider, voyageApiKey, litellmBaseUrl, litellmEmbedModel } = this.settings;
+    const hasCredentials = provider === "litellm" ? !!litellmBaseUrl && !!litellmEmbedModel : !!voyageApiKey;
     return hasCredentials && this.embeddingStore.isIndexed();
   }
   async loadSettings() {
@@ -1865,16 +1871,67 @@ var KbChatSettingTab = class extends import_obsidian2.PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian2.Setting(containerEl).setName("Model").setDesc("Uses the same model selection as Anthropic above.").addDropdown((drop) => {
-        for (const [id, label] of Object.entries(ANTHROPIC_MODELS)) drop.addOption(id, "Claude " + label);
-        if (!(this.plugin.settings.anthropicModel in ANTHROPIC_MODELS))
-          drop.addOption(this.plugin.settings.anthropicModel, this.plugin.settings.anthropicModel);
-        drop.setValue(this.plugin.settings.anthropicModel);
-        drop.onChange(async (v) => {
-          this.plugin.settings.anthropicModel = v;
-          await this.plugin.saveSettings();
+      const modelSection = containerEl.createDiv();
+      const renderModelSelectors = (allModels) => {
+        modelSection.empty();
+        const chatModels = allModels.filter((m) => !/(embed|voyage|rerank)/i.test(m));
+        const embedModels = allModels.filter((m) => /(embed|voyage)/i.test(m));
+        new import_obsidian2.Setting(modelSection).setName("Chat model").addDropdown((drop) => {
+          if (chatModels.length === 0) drop.addOption("", "\u2014 fetch models first \u2014");
+          for (const m of chatModels) drop.addOption(m, m);
+          if (this.plugin.settings.litellmChatModel && !chatModels.includes(this.plugin.settings.litellmChatModel))
+            drop.addOption(this.plugin.settings.litellmChatModel, this.plugin.settings.litellmChatModel);
+          drop.setValue(this.plugin.settings.litellmChatModel);
+          drop.onChange(async (v) => {
+            this.plugin.settings.litellmChatModel = v;
+            await this.plugin.saveSettings();
+          });
         });
-      });
+        new import_obsidian2.Setting(modelSection).setName("Embedding model").addDropdown((drop) => {
+          if (embedModels.length === 0) drop.addOption("", "\u2014 fetch models first \u2014");
+          for (const m of embedModels) drop.addOption(m, m);
+          if (this.plugin.settings.litellmEmbedModel && !embedModels.includes(this.plugin.settings.litellmEmbedModel))
+            drop.addOption(this.plugin.settings.litellmEmbedModel, this.plugin.settings.litellmEmbedModel);
+          drop.setValue(this.plugin.settings.litellmEmbedModel);
+          drop.onChange(async (v) => {
+            this.plugin.settings.litellmEmbedModel = v;
+            await this.plugin.saveSettings();
+          });
+        });
+      };
+      const savedChat = this.plugin.settings.litellmChatModel;
+      const savedEmbed = this.plugin.settings.litellmEmbedModel;
+      const seedModels = [...new Set([savedChat, savedEmbed].filter(Boolean))];
+      renderModelSelectors(seedModels);
+      new import_obsidian2.Setting(containerEl).setName("Available models").setDesc("Fetch the list of models from your LiteLLM instance.").addButton(
+        (btn) => btn.setButtonText("Fetch models").onClick(async () => {
+          const { litellmBaseUrl, litellmApiKey } = this.plugin.settings;
+          if (!litellmBaseUrl) {
+            new import_obsidian2.Notice("Enter a LiteLLM base URL first.");
+            return;
+          }
+          btn.setButtonText("Fetching\u2026");
+          btn.setDisabled(true);
+          try {
+            const resp = await (0, import_obsidian2.requestUrl)({
+              url: `${litellmBaseUrl.replace(/\/$/, "")}/v1/models`,
+              method: "GET",
+              headers: { ...litellmApiKey ? { "Authorization": `Bearer ${litellmApiKey}` } : {} },
+              throw: false
+            });
+            if (resp.status !== 200) throw new Error(`HTTP ${resp.status}`);
+            const data = resp.json;
+            const models = data.data.map((m) => m.id).sort();
+            renderModelSelectors(models);
+            new import_obsidian2.Notice(`Fetched ${models.length} models.`);
+          } catch (e) {
+            new import_obsidian2.Notice(`Failed to fetch models: ${e instanceof Error ? e.message : String(e)}`);
+          } finally {
+            btn.setButtonText("Fetch models");
+            btn.setDisabled(false);
+          }
+        })
+      );
     }
     containerEl.createEl("h3", { text: "Semantic search (Voyage AI)" });
     const voyageDesc = this.plugin.settings.provider === "litellm" ? 'Embeddings are routed through LiteLLM using the voyage model name below. Run "Index vault for semantic search" from the command palette after configuring LiteLLM.' : 'Voyage AI embeddings let the plugin find related notes across your vault and surface them as context. Run "Index vault for semantic search" from the command palette after adding your key.';
